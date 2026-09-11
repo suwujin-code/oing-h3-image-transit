@@ -1,0 +1,48 @@
+name: Decode transit image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'incoming/*.b64'
+
+permissions:
+  contents: write
+
+jobs:
+  decode:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Decode new payloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p images
+          shopt -s nullglob
+          changed=0
+          for src in incoming/*.b64; do
+            base="$(basename "$src" .b64)"
+            case "$base" in
+              *.jpg|*.jpeg|*.png|*.webp) ;;
+              *) echo "Unsupported target extension: $base" >&2; exit 2 ;;
+            esac
+            base64 --decode "$src" > "images/$base"
+            echo "decoded $src -> images/$base"
+            changed=1
+          done
+          if [ "$changed" -eq 0 ]; then
+            echo "No payloads found"
+            exit 0
+          fi
+          git config user.name "oing-h3-transit-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add images/
+          if git diff --cached --quiet; then
+            echo "No image changes"
+            exit 0
+          fi
+          git commit -m "decode: publish transit image"
+          git push
