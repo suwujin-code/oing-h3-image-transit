@@ -1,0 +1,41 @@
+name: Extract H3 reference bundle
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'incoming/tanghua-h3-refs-*.zip'
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Extract exactly one bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          BEFORE='${{ github.event.before }}'
+          AFTER='${{ github.sha }}'
+          mapfile -t bundles < <(git diff --name-only --diff-filter=AM "$BEFORE" "$AFTER" -- 'incoming/tanghua-h3-refs-*.zip')
+          if [ "${#bundles[@]}" -ne 1 ]; then
+            echo "Expected exactly one bundle, got ${#bundles[@]}" >&2
+            exit 1
+          fi
+          bundle="${bundles[0]}"
+          base="$(basename "$bundle" .zip)"
+          dest="images/${base}"
+          rm -rf "$dest"
+          mkdir -p "$dest"
+          unzip -q "$bundle" -d "$dest"
+          test "$(find "$dest" -maxdepth 1 -type f -name '*.jpg' | wc -l)" -eq 9
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$dest"
+          git commit -m "publish: ${base} H3 reference frames"
+          git push origin HEAD:main
