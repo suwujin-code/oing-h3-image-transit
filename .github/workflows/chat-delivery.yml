@@ -1,0 +1,47 @@
+name: Chat delivery bridge
+
+on:
+  push:
+    branches: [main]
+    paths: ['chat-delivery/*.json']
+
+permissions:
+  contents: read
+
+jobs:
+  deliver:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve request and build 2K file
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          REQ=$(git diff --name-only HEAD^ HEAD -- 'chat-delivery/*.json' | head -n1)
+          test -n "$REQ"
+          python3 - "$REQ" <<'PY'
+          import json, sys, urllib.request
+          from pathlib import Path
+          req=json.loads(Path(sys.argv[1]).read_text())
+          url=req['video_url']
+          native=Path('tanghua_native.mp4')
+          with urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':'OING-Chat-Delivery/1.0'}),timeout=180) as src, native.open('wb') as dst:
+              while True:
+                  b=src.read(1024*1024)
+                  if not b: break
+                  dst.write(b)
+          print('native_bytes',native.stat().st_size)
+          PY
+          ffmpeg -y -i tanghua_native.mp4 -map 0:v:0 -map 0:a? -vf "scale=2560:1440:force_original_aspect_ratio=decrease:flags=lanczos,pad=2560:1440:(ow-iw)/2:(oh-ih)/2:black" -c:v libx264 -preset slow -crf 16 -pix_fmt yuv420p -movflags +faststart -c:a aac -b:a 192k tanghua_mooncake_H3_15S_2K_V2.mp4
+          ffprobe -v error -show_entries format=duration,size -show_entries stream=codec_type,codec_name,width,height,r_frame_rate -of json tanghua_mooncake_H3_15S_2K_V2.mp4
+
+      - name: Upload direct chat artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tanghua-mooncake-h3-2k
+          path: tanghua_mooncake_H3_15S_2K_V2.mp4
+          compression-level: 0
+          retention-days: 1
