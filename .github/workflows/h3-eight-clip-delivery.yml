@@ -1,0 +1,137 @@
+name: H3 eight-clip chat delivery
+
+on:
+  push:
+    branches:
+      - delivery/h3-inflight4-20260912
+    paths:
+      - 'deliver-requests/h3-inflight4-20260912.json'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download and verify eight immutable H3 results
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p delivery_out/originals delivery_out/normalized delivery_out/thumbs
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import urllib.request
+          from pathlib import Path
+
+          req_path = Path('deliver-requests/h3-inflight4-20260912.json')
+          req = json.loads(req_path.read_text())
+          rows = req['items']
+          if len(rows) != 8:
+              raise SystemExit(f'expected 8 items, got {len(rows)}')
+
+          manifest = {
+              'delivery_id': req['delivery_id'],
+              'source_run_id': req['source_run_id'],
+              'items': [],
+          }
+          out = Path('delivery_out/originals')
+
+          for index, row in enumerate(rows, 1):
+              label = row['label']
+              filename = f'{index:02d}_{label}.mp4'
+              target = out / filename
+              request = urllib.request.Request(
+                  row['url'],
+                  headers={'User-Agent': 'OING-H3-Chat-Extraction/1.0'},
+              )
+              digest = hashlib.sha256()
+              total = 0
+              with urllib.request.urlopen(request, timeout=240) as src, target.open('wb') as dst:
+                  while True:
+                      chunk = src.read(1024 * 1024)
+                      if not chunk:
+                          break
+                      total += len(chunk)
+                      digest.update(chunk)
+                      dst.write(chunk)
+              actual_sha = digest.hexdigest()
+              if total != int(row['bytes']):
+                  raise SystemExit(f'{label}: byte mismatch {total} != {row["bytes"]}')
+              if actual_sha != row['sha256']:
+                  raise SystemExit(f'{label}: sha256 mismatch')
+              manifest['items'].append({
+                  'label': label,
+                  'filename': filename,
+                  'bytes': total,
+                  'sha256': actual_sha,
+                  'request_id': row['request_id'],
+                  'provider_id': row['provider_id'],
+              })
+              print(json.dumps({'label': label, 'bytes': total, 'sha256': actual_sha}))
+
+          Path('delivery_out/manifest.json').write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+          PY
+
+      - name: Build labeled sequential preview and contact sheet
+        shell: bash
+        run: |
+          set -euo pipefail
+          labels=(A1 A2 A3 A4 B1 B2 B3 B4)
+          i=0
+          : > delivery_out/concat.txt
+          for src in delivery_out/originals/*.mp4; do
+            label="${labels[$i]}"
+            dst="delivery_out/normalized/$(printf '%02d' $((i+1)))_${label}.mp4"
+            ffmpeg -hide_banner -loglevel error -y -i "$src" \
+              -vf "scale=1280:720:force_original_aspect_ratio=decrease:flags=lanczos,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,drawbox=x=24:y=24:w=150:h=58:color=black@0.62:t=fill,drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text='${label}':fontcolor=white:fontsize=34:x=48:y=34" \
+              -an -r 24 -c:v libx264 -preset medium -crf 17 -pix_fmt yuv420p -movflags +faststart "$dst"
+            printf "file '%s'\n" "$(realpath "$dst")" >> delivery_out/concat.txt
+            ffmpeg -hide_banner -loglevel error -y -ss 0.50 -i "$dst" -frames:v 1 \
+              -vf "scale=640:360" "delivery_out/thumbs/$(printf '%02d' $((i+1)))_${label}.png"
+            i=$((i+1))
+          done
+
+          ffmpeg -hide_banner -loglevel error -y -f concat -safe 0 -i delivery_out/concat.txt \
+            -an -c:v libx264 -preset medium -crf 17 -pix_fmt yuv420p -movflags +faststart \
+            delivery_out/H3_8clips_sequential_preview.mp4
+
+          ffmpeg -hide_banner -loglevel error -y \
+            -i delivery_out/thumbs/01_A1.png -i delivery_out/thumbs/02_A2.png \
+            -i delivery_out/thumbs/03_A3.png -i delivery_out/thumbs/04_A4.png \
+            -i delivery_out/thumbs/05_B1.png -i delivery_out/thumbs/06_B2.png \
+            -i delivery_out/thumbs/07_B3.png -i delivery_out/thumbs/08_B4.png \
+            -filter_complex "xstack=inputs=8:layout=0_0|640_0|1280_0|1920_0|0_360|640_360|1280_360|1920_360:fill=black" \
+            -frames:v 1 delivery_out/H3_8clips_contact_sheet.png
+
+          ffprobe -v error -show_entries format=duration,size \
+            -show_entries stream=codec_type,codec_name,width,height,r_frame_rate \
+            -of json delivery_out/H3_8clips_sequential_preview.mp4 \
+            > delivery_out/preview_ffprobe.json
+
+          (cd delivery_out && zip -9 -r H3_8clips_originals_and_preview.zip \
+            originals H3_8clips_sequential_preview.mp4 H3_8clips_contact_sheet.png \
+            manifest.json preview_ffprobe.json >/dev/null)
+          ls -lh delivery_out delivery_out/originals
+
+      - name: Upload direct chat package
+        uses: actions/upload-artifact@v4
+        with:
+          name: H3-inflight4-eight-clips
+          path: |
+            delivery_out/H3_8clips_sequential_preview.mp4
+            delivery_out/H3_8clips_contact_sheet.png
+            delivery_out/H3_8clips_originals_and_preview.zip
+            delivery_out/manifest.json
+            delivery_out/preview_ffprobe.json
+            delivery_out/originals/*.mp4
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
