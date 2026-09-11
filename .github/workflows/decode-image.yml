@@ -34,10 +34,13 @@ jobs:
           branch=os.environ['BRANCH']
           head=os.environ['HEAD_SHA']
           names=subprocess.check_output(
-              ['git','diff-tree','--no-commit-id','--name-only','-r',head],
+              ['git','diff-tree','--no-commit-id','--name-only','--diff-filter=AM','-r',head],
               text=True,
           ).splitlines()
           files=[Path(p) for p in names if p.startswith('incoming/') and p.endswith('.b64')]
+          if not files:
+              print('No added/modified incoming payload; cleanup-only push, nothing to publish.')
+              raise SystemExit(0)
           if len(files) != 1:
               raise SystemExit(f'Expected exactly one changed incoming payload, got: {names}')
 
@@ -56,25 +59,38 @@ jobs:
               'X-GitHub-Api-Version': '2022-11-28',
               'Content-Type': 'application/json',
           }
-          api=f'https://api.github.com/repos/{repo}/contents/images/{target}'
-          sha=None
-          get=urllib.request.Request(api+'?ref='+branch,headers=headers)
+          def request(method, url, payload=None):
+              data=None if payload is None else json.dumps(payload).encode()
+              req=urllib.request.Request(url,data=data,headers=headers,method=method)
+              try:
+                  with urllib.request.urlopen(req,timeout=60) as r:
+                      return r.status, json.load(r) if r.length != 0 else {}
+              except urllib.error.HTTPError as e:
+                  body=e.read().decode(errors='replace')
+                  print('HTTP_ERROR',method,url,e.code,body)
+                  raise
+
+          target_api=f'https://api.github.com/repos/{repo}/contents/images/{target}'
+          target_sha=None
           try:
-              with urllib.request.urlopen(get,timeout=30) as r:
-                  sha=json.load(r).get('sha')
+              _, existing=request('GET',target_api+'?ref='+branch)
+              target_sha=existing.get('sha')
           except urllib.error.HTTPError as e:
               if e.code != 404:
                   raise
 
           payload={'message':f'publish: {target}','content':content,'branch':branch}
-          if sha:
-              payload['sha']=sha
-          put=urllib.request.Request(api,data=json.dumps(payload).encode(),headers=headers,method='PUT')
-          try:
-              with urllib.request.urlopen(put,timeout=60) as r:
-                  data=json.load(r)
-                  print('published',target,'bytes',len(raw),'commit',data.get('commit',{}).get('sha'))
-          except urllib.error.HTTPError as e:
-              print('HTTP_ERROR',e.code,e.read().decode(errors='replace'))
-              raise
+          if target_sha:
+              payload['sha']=target_sha
+          _, published=request('PUT',target_api,payload)
+          print('published',target,'bytes',len(raw),'commit',published.get('commit',{}).get('sha'))
+
+          source_sha=subprocess.check_output(['git','rev-parse',f'{head}:{src.as_posix()}'],text=True).strip()
+          source_api=f'https://api.github.com/repos/{repo}/contents/{src.as_posix()}'
+          _, removed=request('DELETE',source_api,{
+              'message':f'cleanup: remove payload for {target}',
+              'sha':source_sha,
+              'branch':branch,
+          })
+          print('cleaned',src,'commit',removed.get('commit',{}).get('sha'))
           PY
