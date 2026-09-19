@@ -1,0 +1,53 @@
+name: Import verified generated H3 reference
+on:
+  push:
+    branches: [main]
+    paths: ['incoming-url/*.json']
+permissions:
+  contents: write
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Import exactly one authorized generated image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, json, os, re, subprocess
+          from pathlib import Path
+          from urllib.parse import urlsplit
+          from urllib.request import Request, urlopen, HTTPRedirectHandler, build_opener
+          class NoRedirect(HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs): return None
+          opener=build_opener(NoRedirect())
+          head=os.environ['GITHUB_SHA']
+          paths=subprocess.check_output(['git','diff-tree','--no-commit-id','--name-only','--diff-filter=A','-r',head],text=True).splitlines()
+          paths=[p for p in paths if re.fullmatch(r'incoming-url/[A-Za-z0-9_-]+\.json',p)]
+          if len(paths)!=1: raise SystemExit('Exactly one new image intake required')
+          src=Path(paths[0]); obj=json.loads(src.read_text())
+          if set(obj)!={'source_url','output_name','expected_sha256','expected_bytes','generated_asset_public_ok'}: raise SystemExit('Invalid fields')
+          if obj['generated_asset_public_ok'] is not True: raise SystemExit('Public generated asset authorization required')
+          name=obj['output_name']; expected=obj['expected_bytes']; sha=obj['expected_sha256']
+          if not re.fullmatch(r'[A-Za-z0-9_-]{1,100}\.jpg',name): raise SystemExit('Invalid JPEG filename')
+          if type(expected)!=int or not 100<=expected<=10000000 or not re.fullmatch(r'[0-9a-f]{64}',sha): raise SystemExit('Invalid integrity contract')
+          u=urlsplit(obj['source_url']); host=(u.hostname or '').lower()
+          if u.scheme!='https' or not host.endswith('.oaiusercontent.com') or u.username or u.password or u.port not in (None,443): raise SystemExit('Only scoped ChatGPT image downloads are accepted')
+          with opener.open(Request(obj['source_url'],headers={'User-Agent':'OING-H3-Image-Transit'}),timeout=90) as r: raw=r.read(expected+1)
+          if len(raw)!=expected or hashlib.sha256(raw).hexdigest()!=sha: raise SystemExit('Image bytes/hash mismatch')
+          if not raw.startswith(b'\xff\xd8\xff') or not raw.endswith(b'\xff\xd9'): raise SystemExit('Not a JPEG')
+          repo=os.environ['GITHUB_REPOSITORY']; token=os.environ['GH_TOKEN']
+          headers={'Authorization':'Bearer '+token,'Accept':'application/vnd.github+json','Content-Type':'application/json'}
+          payload={'message':'publish verified generated H3 reference '+name,'branch':'main','content':base64.b64encode(raw).decode()}
+          req=Request('https://api.github.com/repos/'+repo+'/contents/images/'+name,data=json.dumps(payload).encode(),headers=headers,method='PUT')
+          with urlopen(req,timeout=60) as r: result=json.load(r)
+          print(json.dumps({'image_path':'images/'+name,'bytes':len(raw),'sha256':sha,'commit':result['commit']['sha']}))
+          source_sha=subprocess.check_output(['git','rev-parse',head+':'+str(src)],text=True).strip()
+          cleanup={'message':'cleanup expiring generated image intake','branch':'main','sha':source_sha}
+          req=Request('https://api.github.com/repos/'+repo+'/contents/'+str(src),data=json.dumps(cleanup).encode(),headers=headers,method='DELETE')
+          with urlopen(req,timeout=60) as r: r.read()
+          PY
