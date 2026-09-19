@@ -14,34 +14,59 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
-      - name: Resolve request and build 2K file
-        id: build
+      - name: Resolve request and retrieve original media
+        id: retrieve
         shell: bash
         run: |
           set -euo pipefail
-          REQ=$(git diff --name-only HEAD^ HEAD -- 'chat-delivery/*.json' | head -n1)
-          test -n "$REQ"
-          python3 - "$REQ" <<'PY'
-          import json, sys, urllib.request
+          python3 - <<'PY'
+          import hashlib, json, os, re, subprocess, urllib.request
           from pathlib import Path
-          req=json.loads(Path(sys.argv[1]).read_text())
-          url=req['video_url']
-          native=Path('tanghua_native.mp4')
-          with urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':'OING-Chat-Delivery/1.0'}),timeout=180) as src, native.open('wb') as dst:
+          from urllib.parse import urlsplit
+          paths=subprocess.check_output(['git','diff-tree','--no-commit-id','--name-only','--diff-filter=AM','-r',os.environ['GITHUB_SHA']],text=True).splitlines()
+          paths=[p for p in paths if re.fullmatch(r'chat-delivery/[A-Za-z0-9_-]+\.json',p)]
+          if len(paths)!=1: raise SystemExit('Expected exactly one delivery request')
+          req=json.loads(Path(paths[0]).read_text())
+          url=req['video_url']; u=urlsplit(url)
+          if u.scheme!='https' or u.username or u.password: raise SystemExit('Expected HTTPS media URL')
+          native_only=req.get('native',False) is True
+          filename=req.get('output_name','tanghua_native.mp4') if native_only else 'tanghua_native.mp4'
+          if not re.fullmatch(r'[A-Za-z0-9_.-]{1,160}\.mp4',filename): raise SystemExit('Invalid MP4 filename')
+          expected=req.get('expected_bytes'); expected_sha=req.get('expected_sha256')
+          if native_only and (type(expected)!=int or not 1<=expected<=200000000 or not re.fullmatch(r'[0-9a-f]{64}',expected_sha or '')): raise SystemExit('Native delivery requires expected bytes and SHA256')
+          target=Path(filename); digest=hashlib.sha256(); size=0
+          with urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':'OING-Chat-Delivery/1.1'}),timeout=180) as src, target.open('wb') as dst:
               while True:
                   b=src.read(1024*1024)
                   if not b: break
-                  dst.write(b)
-          print('native_bytes',native.stat().st_size)
+                  size+=len(b)
+                  if size>200000000 or (expected and size>expected): raise SystemExit('Media size exceeds contract')
+                  dst.write(b); digest.update(b)
+          if expected and size!=expected: raise SystemExit('Byte length mismatch')
+          if expected_sha and digest.hexdigest()!=expected_sha: raise SystemExit('SHA256 mismatch')
+          if target.read_bytes()[4:8]!=b'ftyp': raise SystemExit('MP4 container signature missing')
+          print(json.dumps({'verified':True,'bytes':size,'sha256':digest.hexdigest(),'native':native_only}))
+          with open(os.environ['GITHUB_OUTPUT'],'a') as out:
+              out.write('native='+str(native_only).lower()+'\n')
+              out.write('path='+(filename if native_only else 'tanghua_mooncake_H3_15S_2K_V2.mp4')+'\n')
+              out.write('artifact='+('H3-chat-native-'+os.environ['GITHUB_RUN_ID'] if native_only else 'tanghua-mooncake-h3-2k')+'\n')
           PY
+
+      - name: Preserve legacy optional 2K delivery
+        if: steps.retrieve.outputs.native != 'true'
+        shell: bash
+        run: |
           ffmpeg -y -i tanghua_native.mp4 -map 0:v:0 -map 0:a? -vf "scale=2560:1440:force_original_aspect_ratio=decrease:flags=lanczos,pad=2560:1440:(ow-iw)/2:(oh-ih)/2:black" -c:v libx264 -preset slow -crf 16 -pix_fmt yuv420p -movflags +faststart -c:a aac -b:a 192k tanghua_mooncake_H3_15S_2K_V2.mp4
           ffprobe -v error -show_entries format=duration,size -show_entries stream=codec_type,codec_name,width,height,r_frame_rate -of json tanghua_mooncake_H3_15S_2K_V2.mp4
 
       - name: Upload direct chat artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tanghua-mooncake-h3-2k
-          path: tanghua_mooncake_H3_15S_2K_V2.mp4
+          name: ${{ steps.retrieve.outputs.artifact }}
+          path: ${{ steps.retrieve.outputs.path }}
           compression-level: 0
           retention-days: 1
+          if-no-files-found: error
