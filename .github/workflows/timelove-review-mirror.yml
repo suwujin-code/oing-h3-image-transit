@@ -1,0 +1,45 @@
+name: TimeLove synthetic review frames
+on:
+  push:
+    branches: [main]
+    paths: ['timelove-review/*.json']
+permissions:
+  contents: write
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Mirror actual review JPGs, never generate or publish source portraits
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64,hashlib,json,os,re
+          from urllib.request import Request,urlopen
+          from urllib.error import HTTPError
+          from urllib.parse import quote
+          repo=os.environ['GITHUB_REPOSITORY'];sha=os.environ['GITHUB_SHA'];token=os.environ['GH_TOKEN']
+          h={'Authorization':'Bearer '+token,'Accept':'application/vnd.github+json','User-Agent':'TimeLove-Frame-Mirror/1.0'}
+          def get(u):
+              with urlopen(Request(u,headers=h),timeout=45) as r:return json.load(r)
+          rows=[x['filename'] for x in get(f'https://api.github.com/repos/{repo}/commits/{sha}')['files'] if x['status'] in ('added','modified') and re.fullmatch(r'timelove-review/[A-Za-z0-9_-]+\.json',x['filename'])]
+          if len(rows)!=1:raise SystemExit('One request only')
+          j=get(f'https://api.github.com/repos/{repo}/contents/{rows[0]}?ref={sha}')
+          s=json.loads(base64.b64decode(j['content']));tag=s['tag']
+          if s.get('synthetic_demo_only') is not True or not re.fullmatch(r'TL-20260919-[A-Za-z0-9_-]+',tag):raise SystemExit('Only this synthetic demo is allowed')
+          for name in s['files']:
+              if not re.fullmatch(r'0[123]-(frames|tail)\.jpg',name):raise SystemExit('Only bounded review JPGs, no source portraits')
+              url=f'https://oing.xin/design-center/downloads/{tag}/{name}'
+              with urlopen(Request(url,headers={'User-Agent':'TimeLove-Frame-Mirror/1.0'}),timeout=60) as r:data=r.read(2000001)
+              if len(data)>2000000 or not data.startswith(b'\xff\xd8'):raise SystemExit('Invalid JPEG')
+              path=f'images/timelove/{tag}/{name}';api=f'https://api.github.com/repos/{repo}/contents/{path}'
+              body={'message':'TimeLove actual synthetic H3 review frame '+name,'content':base64.b64encode(data).decode(),'branch':'main'}
+              try:body['sha']=get(api+'?ref=main')['sha']
+              except HTTPError as e:
+                  if e.code!=404:raise
+              hh=dict(h);hh['Content-Type']='application/json'
+              with urlopen(Request(api,data=json.dumps(body).encode(),headers=hh,method='PUT'),timeout=60) as r:json.load(r)
+              print(json.dumps({'name':name,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),'url':f'https://raw.githubusercontent.com/{repo}/main/{path}'}))
+          PY
